@@ -5,6 +5,7 @@ from threading import Lock
 from typing import Optional, Set
 
 from fastapi import FastAPI, Body, WebSocket, WebSocketDisconnect, Header, HTTPException, Query
+from fastapi.responses import RedirectResponse, Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, conint
 
@@ -29,6 +30,18 @@ app.add_middleware(
 )
 
 _state_lock = Lock()
+
+@app.get("/", include_in_schema=False)
+def root():
+    # Option A: redirect to docs
+    return RedirectResponse(url="/docs")
+    # Option B (instead): return current state
+    # return JSONResponse(load_state())
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    # Avoid noisy 404s from the browser
+    return Response(status_code=204)
 
 def load_state():
     if os.path.exists(STATE_FILE):
