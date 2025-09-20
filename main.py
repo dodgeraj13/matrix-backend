@@ -1,156 +1,154 @@
-import os
 import json
-import asyncio
-from threading import Lock
-from typing import Optional, Set
+import os
+from typing import Dict, List
 
-from fastapi import FastAPI, Body, WebSocket, WebSocketDisconnect, Header, HTTPException, Query
-from fastapi.responses import RedirectResponse, Response, JSONResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, conint
+from pydantic import BaseModel, Field, field_validator
 
-# ---- Configuration ----
-# Defaults
-DEFAULT_STATE = {"mode": 0, "brightness": 60}  # brightness 0..100 (0 => off)
-# Path to JSON file for persistence (point to /data/state.json on Render with a Disk)
-STATE_FILE = os.environ.get("STATE_FILE", "state.json")
-# Optional API token for write access and WS connection (recommended)
-API_TOKEN = os.environ.get("API_TOKEN")
-# Comma-separated list of allowed origins for CORS (e.g., "https://your-frontend.vercel.app")
-CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "*").split(",")
+# --------------------------
+# Config / ENV
+# --------------------------
+API_TOKEN = os.getenv("API_TOKEN", "")
+STATE_FILE = os.getenv("STATE_FILE", "/tmp/state.json")
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*")
 
-app = FastAPI()
+VALID_ROTATIONS = {0, 90, 180, 270}
 
+DEFAULT_STATE = {"mode": 0, "brightness": 60, "rotation": 0}
+
+# --------------------------
+# Models
+# --------------------------
+class State(BaseModel):
+    mode: int = Field(0, ge=0, le=5)            # 0..5 (0=Idle, 1=MLB, 2=Music, 3=Clock, 4=Weather, 5=Picture)
+    brightness: int = Field(60, ge=0, le=100)   # 0..100
+    rotation: int = Field(0)                    # 0,90,180,270
+
+    @field_validator("rotation")
+    @classmethod
+    def _rot_ok(cls, v: int) -> int:
+        if v not in VALID_ROTATIONS:
+            raise ValueError("rotation must be one of 0, 90, 180, 270")
+        return v
+
+# --------------------------
+# App + CORS
+# --------------------------
+app = FastAPI(title="Matrix Backend", version="1.1")
+
+allowed_origins = [o.strip() for o in CORS_ORIGINS.split(",")] if CORS_ORIGINS else ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
+    allow_origins=allowed_origins if allowed_origins != ["*"] else ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-_state_lock = Lock()
-
-@app.get("/", include_in_schema=False)
-def root():
-    # Option A: redirect to docs
-    return RedirectResponse(url="/docs")
-    # Option B (instead): return current state
-    # return JSONResponse(load_state())
-
-@app.get("/favicon.ico", include_in_schema=False)
-def favicon():
-    # Avoid noisy 404s from the browser
-    return Response(status_code=204)
+# --------------------------
+# State persistence
+# --------------------------
+_state: Dict = DEFAULT_STATE.copy()
 
 def load_state():
-    if os.path.exists(STATE_FILE):
-        try:
+    global _state
+    try:
+        if os.path.exists(STATE_FILE):
             with open(STATE_FILE, "r") as f:
                 data = json.load(f)
-                mode = int(data.get("mode", DEFAULT_STATE["mode"]))
-                brightness = int(data.get("brightness", DEFAULT_STATE["brightness"]))
-                brightness = max(0, min(100, brightness))  # clamp 0..100
-                return {"mode": mode, "brightness": brightness}
-        except Exception:
-            pass
-    return DEFAULT_STATE.copy()
+            # merge defaults to ensure all keys present
+            merged = DEFAULT_STATE.copy()
+            merged.update({k: data.get(k, merged[k]) for k in DEFAULT_STATE.keys()})
+            _state = merged
+        else:
+            save_state(_state)
+    except Exception:
+        _state = DEFAULT_STATE.copy()
 
-def save_state(state):
-    # Ensure directory exists (STATE_FILE could be /data/state.json)
-    dirpath = os.path.dirname(STATE_FILE)
-    if dirpath:
-        os.makedirs(dirpath, exist_ok=True)
+def save_state(s: Dict):
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
     with open(STATE_FILE, "w") as f:
-        json.dump(state, f)
+        json.dump(s, f)
 
-def check_auth(authorization: Optional[str]):
-    if API_TOKEN:
-        if not authorization or not authorization.startswith("Bearer "):
-            raise HTTPException(status_code=401, detail="Missing/invalid Authorization")
-        token = authorization.split(" ", 1)[1]
-        if token != API_TOKEN:
-            raise HTTPException(status_code=403, detail="Invalid token")
+load_state()
 
-class StatePatch(BaseModel):
-    mode: Optional[int] = None
-    brightness: Optional[conint(ge=0, le=100)] = None  # 0..100
+# --------------------------
+# Auth
+# --------------------------
+def _require_token(auth_header: str | None):
+    if not API_TOKEN:
+        return
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing token")
+    tok = auth_header.split(" ", 1)[1].strip()
+    if tok != API_TOKEN:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Bad token")
 
+def require_auth(authorization: str | None = None):
+    _require_token(authorization)
+
+# --------------------------
+# WebSocket manager
+# --------------------------
+class WSManager:
+    def __init__(self):
+        self.active: List[WebSocket] = []
+
+    async def connect(self, ws: WebSocket):
+        await ws.accept()
+        self.active.append(ws)
+
+    def disconnect(self, ws: WebSocket):
+        if ws in self.active:
+            self.active.remove(ws)
+
+    async def broadcast(self, msg: Dict):
+        living = []
+        for ws in self.active:
+            try:
+                await ws.send_json(msg)
+                living.append(ws)
+            except Exception:
+                pass
+        self.active = living
+
+manager = WSManager()
+
+# --------------------------
+# Routes
+# --------------------------
 @app.get("/health")
 def health():
     return {"ok": True}
 
-@app.get("/state")
+@app.get("/")
+def root_redirect():
+    # gentle redirect to docs in a way render shows something at /
+    return {"message": "Matrix backend running. See /docs", "endpoints": ["/state", "/ws", "/health"]}
+
+@app.get("/state", response_model=State)
 def get_state():
-    with _state_lock:
-        return load_state()
+    return _state
 
-
-# ---- WebSocket manager ----
-class ConnectionManager:
-    def __init__(self):
-        self.active: Set[WebSocket] = set()
-        self.lock = asyncio.Lock()
-
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        async with self.lock:
-            self.active.add(websocket)
-        # Push current state immediately
-        await self.send_state(websocket)
-
-    async def disconnect(self, websocket: WebSocket):
-        async with self.lock:
-            self.active.discard(websocket)
-
-    async def send_state(self, websocket: WebSocket):
-        await websocket.send_json({"type": "state", "payload": load_state()})
-
-    async def broadcast(self, message: dict):
-        dead = []
-        async with self.lock:
-            for ws in list(self.active):
-                try:
-                    await ws.send_json(message)
-                except Exception:
-                    dead.append(ws)
-            for ws in dead:
-                self.active.discard(ws)
-
-manager = ConnectionManager()
+@app.post("/state", response_model=State, dependencies=[Depends(require_auth)])
+async def set_state(new: State):
+    global _state
+    _state = {"mode": new.mode, "brightness": new.brightness, "rotation": new.rotation}
+    save_state(_state)
+    await manager.broadcast({"type": "state", **_state})
+    return _state
 
 @app.websocket("/ws")
-async def ws_endpoint(websocket: WebSocket, token: Optional[str] = Query(default=None)):
-    # Optional token check via query param
-    if API_TOKEN and token != API_TOKEN:
-        await websocket.close(code=1008)  # policy violation
-        return
+async def ws_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     try:
+        # send current state on connect
+        await websocket.send_json({"type": "state", **_state})
         while True:
-            # keepalive: client can send "ping" or any text; we ignore content
+            # we don't require client messages; keep connection alive
             await websocket.receive_text()
     except WebSocketDisconnect:
-        await manager.disconnect(websocket)
-
-@app.post("/state")
-async def patch_state(
-    patch: StatePatch = Body(...),
-    authorization: Optional[str] = Header(default=None),
-):
-    # Require token for modifications
-    check_auth(authorization)
-    changed = False
-    with _state_lock:
-        state = load_state()
-        if patch.mode is not None:
-            state["mode"] = int(patch.mode)
-            changed = True
-        if patch.brightness is not None:
-            state["brightness"] = int(patch.brightness)
-            changed = True
-        if changed:
-            save_state(state)
-    if changed:
-        await manager.broadcast({"type": "state", "payload": state})
-    return state
+        manager.disconnect(websocket)
+    except Exception:
+        manager.disconnect(websocket)
