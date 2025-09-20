@@ -2,15 +2,20 @@ import json
 import os
 from typing import Dict, List
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, status, Header
-#                                                                                ^^^^^^^
 
-def require_auth(authorization: str | None = Header(None)):
-    _require_token(authorization)
+def require_auth(
+    authorization: str | None = Header(default=None),
+    token: str | None = None,  # optional ?token=... fallback (handy during debugging)
+):
+    # prefer header if present, otherwise allow ?token=... for convenience
+    auth_val = authorization
+    if (not auth_val) and token:
+        auth_val = f"Bearer {token}"
+    _require_token(auth_val)
 
 # --------------------------
 # Config / ENV
