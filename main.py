@@ -2,30 +2,26 @@ import json
 import os
 from typing import Dict, List
 
+from fastapi import (
+    FastAPI,
+    WebSocket,
+    WebSocketDisconnect,
+    Depends,
+    HTTPException,
+    status,
+    Header,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
-
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, status, Header
-
-def require_auth(
-    authorization: str | None = Header(default=None),
-    token: str | None = None,  # optional ?token=... fallback (handy during debugging)
-):
-    # prefer header if present, otherwise allow ?token=... for convenience
-    auth_val = authorization
-    if (not auth_val) and token:
-        auth_val = f"Bearer {token}"
-    _require_token(auth_val)
 
 # --------------------------
 # Config / ENV
 # --------------------------
-API_TOKEN = os.getenv("API_TOKEN", "")
+API_TOKEN = (os.getenv("API_TOKEN", "") or "").strip()
 STATE_FILE = os.getenv("STATE_FILE", "/tmp/state.json")
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*")
 
 VALID_ROTATIONS = {0, 90, 180, 270}
-
 DEFAULT_STATE = {"mode": 0, "brightness": 60, "rotation": 0}
 
 # --------------------------
@@ -46,7 +42,7 @@ class State(BaseModel):
 # --------------------------
 # App + CORS
 # --------------------------
-app = FastAPI(title="Matrix Backend", version="1.1")
+app = FastAPI(title="Matrix Backend", version="1.2")
 
 allowed_origins = [o.strip() for o in CORS_ORIGINS.split(",")] if CORS_ORIGINS else ["*"]
 app.add_middleware(
@@ -68,9 +64,10 @@ def load_state():
         if os.path.exists(STATE_FILE):
             with open(STATE_FILE, "r") as f:
                 data = json.load(f)
-            # merge defaults to ensure all keys present
             merged = DEFAULT_STATE.copy()
-            merged.update({k: data.get(k, merged[k]) for k in DEFAULT_STATE.keys()})
+            for k in DEFAULT_STATE.keys():
+                if k in data:
+                    merged[k] = data[k]
             _state = merged
         else:
             save_state(_state)
@@ -88,6 +85,7 @@ load_state()
 # Auth
 # --------------------------
 def _require_token(auth_header: str | None):
+    # If API token is unset on server, allow (no auth in dev)
     if not API_TOKEN:
         return
     if not auth_header or not auth_header.startswith("Bearer "):
@@ -96,8 +94,14 @@ def _require_token(auth_header: str | None):
     if tok != API_TOKEN:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Bad token")
 
-def require_auth(authorization: str | None = None):
-    _require_token(authorization)
+def require_auth(
+    authorization: str | None = Header(default=None),
+    token: str | None = None,  # optional ?token=... fallback (handy for debugging)
+):
+    auth_val = authorization
+    if (not auth_val) and token:
+        auth_val = f"Bearer {token}"
+    _require_token(auth_val)
 
 # --------------------------
 # WebSocket manager
@@ -134,8 +138,7 @@ def health():
     return {"ok": True}
 
 @app.get("/")
-def root_redirect():
-    # gentle redirect to docs in a way render shows something at /
+def root():
     return {"message": "Matrix backend running. See /docs", "endpoints": ["/state", "/ws", "/health"]}
 
 @app.get("/state", response_model=State)
@@ -157,9 +160,26 @@ async def ws_endpoint(websocket: WebSocket):
         # send current state on connect
         await websocket.send_json({"type": "state", **_state})
         while True:
-            # we don't require client messages; keep connection alive
+            # keep connection; messages from clients are optional
             await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)
     except Exception:
         manager.disconnect(websocket)
+
+# -------- Optional diag endpoint (remove later if you like)
+@app.get("/_authcheck")
+def authcheck(authorization: str | None = Header(default=None), token: str | None = None):
+    api_set = bool(API_TOKEN)
+    provided = authorization or (f"Bearer {token}" if token else None)
+    has_bearer = bool(provided and provided.startswith("Bearer "))
+    same = False
+    if has_bearer and api_set:
+        same = (provided.split(" ",1)[1].strip() == API_TOKEN)
+    return {
+        "api_token_set": api_set,
+        "got_header": authorization is not None,
+        "got_token_param": token is not None,
+        "has_bearer_prefix": has_bearer,
+        "match": same,
+    }
