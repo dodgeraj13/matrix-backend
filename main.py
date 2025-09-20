@@ -6,6 +6,12 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPExcept
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, status, Header
+#                                                                                ^^^^^^^
+
+def require_auth(authorization: str | None = Header(None)):
+    _require_token(authorization)
+
 # --------------------------
 # Config / ENV
 # --------------------------
