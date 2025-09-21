@@ -7,8 +7,11 @@ services:
       - key: API_TOKEN
         sync: false
       - key: CORS_ORIGINS
-        value: https://your-frontend.vercel.app
-      - key: STATE_FILE
-        value: ./state.json    # local file; not durable on free tier
+        value: https://your-frontend.vercel.app,http://localhost:3000
+      - key: REDIS_URL
+        sync: false
+      # If you later upgrade to Starter plan and add a disk, you can set:
+      # - key: STATE_FILE
+      #   value: /data/state.json
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
