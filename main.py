@@ -1,37 +1,44 @@
 from __future__ import annotations
-import os, json, asyncio
+
+import os
+import json
+import asyncio
 from typing import Optional, Dict, Any
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Header, HTTPException, Request
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Header, HTTPException
 from fastapi.responses import JSONResponse, RedirectResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
 
-# --- Config / env ---
-API_TOKEN = os.getenv("API_TOKEN", "MY_SUPER_TOKEN_123")
-CORS_ORIGINS = (os.getenv("CORS_ORIGINS") or "").split(",") if os.getenv("CORS_ORIGINS") else ["*"]
-STATE_FILE = os.getenv("STATE_FILE")  # e.g. /data/state.json (requires Render Disk)
-REDIS_URL  = os.getenv("REDIS_URL")   # e.g. rediss://:password@host:port
-REDIS_KEY  = os.getenv("REDIS_KEY", "matrix:state")
 
-# --- Persistence layer ---
+# ---------------- Env / Config ----------------
+API_TOKEN   = os.getenv("API_TOKEN", "MY_SUPER_TOKEN_123")
+STATE_FILE  = os.getenv("STATE_FILE")   # e.g. /data/state.json (requires Render disk)
+REDIS_URL   = os.getenv("REDIS_URL")    # e.g. rediss://:password@host:port
+REDIS_KEY   = os.getenv("REDIS_KEY", "matrix:state")
+CORS_ORIGINS_ENV = os.getenv("CORS_ORIGINS", "")
+
+# ---------------- Persistence ----------------
 class StateStore:
     def __init__(self):
         self._mem: Dict[str, Any] = {"mode": 0, "brightness": 60, "rotation": 0}
         self._mode: str = "memory"
         self._r = None
+
         if REDIS_URL:
             try:
                 from redis import Redis
                 self._r = Redis.from_url(REDIS_URL, decode_responses=True)
-                # test
                 self._r.ping()
                 self._mode = "redis"
             except Exception as e:
-                print(f"[store] REDIS_URL set but unusable: {e}; will try file or memory.")
+                print(f"[store] REDIS_URL set but unusable: {e}; falling back.")
                 self._r = None
+
         if self._mode != "redis" and STATE_FILE:
             self._mode = "file"
+
         print(f"[store] mode = {self._mode}")
 
     def load(self) -> Dict[str, Any]:
@@ -49,11 +56,10 @@ class StateStore:
         return self._mem.copy()
 
     def save(self, state: Dict[str, Any]) -> None:
-        # normalize
         s = {
             "mode": int(state.get("mode", 0)),
             "brightness": max(0, min(100, int(state.get("brightness", 60)))),
-            "rotation": int(state.get("rotation", 0)) % 360
+            "rotation": int(state.get("rotation", 0)) % 360,
         }
         try:
             if self._mode == "redis" and self._r:
@@ -67,10 +73,12 @@ class StateStore:
             print(f"[store] save error: {e}")
             self._mem = s
 
+
 store = StateStore()
 _state = store.load()
 
-# --- Websocket hub ---
+
+# ---------------- WebSocket Hub ----------------
 class Hub:
     def __init__(self):
         self.active: set[WebSocket] = set()
@@ -95,46 +103,51 @@ class Hub:
             for ws in dead:
                 self.active.discard(ws)
 
+
 hub = Hub()
 
-# --- API models ---
+
+# ---------------- Models ----------------
 class StateIn(BaseModel):
     mode: Optional[int] = Field(default=None, ge=0)
     brightness: Optional[int] = Field(default=None, ge=0, le=100)
-    rotation: Optional[int] = Field(default=None)  # 0, 90, 180, 270 etc.
+    rotation: Optional[int] = Field(default=None)  # 0, 90, 180, 270, etc.
 
-# --- lifespan ---
+
+# ---------------- Lifespan ----------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Ensure _state is loaded at boot
     global _state
     _state = store.load()
     yield
-    # Optionally re-save on shutdown
     try:
         store.save(_state)
     except Exception:
         pass
 
+
 app = FastAPI(lifespan=lifespan)
 
-# CORS
+# ---------------- CORS (single middleware) ----------------
+origins_list = [o.strip() for o in CORS_ORIGINS_ENV.split(",") if o.strip()] or ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS if CORS_ORIGINS != ["*"] else ["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=origins_list,  # e.g. ["https://matrix-frontend-xxx.vercel.app", "http://localhost:3000"]
+    allow_credentials=False,     # keep False if using "*"
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "*"],
 )
+print("CORS allow_origins =", origins_list)
 
-# --- Helpers ---
+
+# ---------------- Helpers ----------------
 def auth_ok(authorization: Optional[str]) -> bool:
     if not API_TOKEN:
         return True
     if not authorization:
         return False
     try:
-        scheme, token = authorization.split(" ", 2)
+        scheme, token = authorization.split(" ", 1)
     except ValueError:
         return False
     return scheme.lower() == "bearer" and token == API_TOKEN
@@ -150,10 +163,15 @@ async def save_and_broadcast():
     store.save(_state)
     await hub.broadcast({"type": "state", **current_state()})
 
-# --- Routes ---
+
+# ---------------- Routes ----------------
 @app.get("/", include_in_schema=False)
 def root():
     return RedirectResponse("/docs")
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    return PlainTextResponse("", status_code=204)
 
 @app.get("/health")
 def health():
@@ -185,10 +203,10 @@ async def ws(ws: WebSocket):
     await ws.accept()
     await hub.register(ws)
     try:
-        # send current state immediately so the Pi syncs on connect/reconnect
-        await ws.send_json({"type":"state", **current_state()})
+        # Send current state immediately so clients (Pi/FE) sync on connect
+        await ws.send_json({"type": "state", **current_state()})
         while True:
-            # We don’t require messages from clients, but we keep the socket open
+            # We don't require messages from clients; keep socket open
             await ws.receive_text()
     except WebSocketDisconnect:
         pass
