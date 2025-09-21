@@ -1,31 +1,32 @@
 from __future__ import annotations
-
-import os
-import json
-import asyncio
+import os, json, asyncio
 from typing import Optional, Dict, Any
-
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Header, HTTPException
-from fastapi.responses import JSONResponse, RedirectResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
 
+# --- Config / env ---
+API_TOKEN    = os.getenv("API_TOKEN", "MY_SUPER_TOKEN_123")
 
-# ---------------- Env / Config ----------------
-API_TOKEN   = os.getenv("API_TOKEN", "MY_SUPER_TOKEN_123")
-STATE_FILE  = os.getenv("STATE_FILE")   # e.g. /data/state.json (requires Render disk)
-REDIS_URL   = os.getenv("REDIS_URL")    # e.g. rediss://:password@host:port
-REDIS_KEY   = os.getenv("REDIS_KEY", "matrix:state")
-CORS_ORIGINS_ENV = os.getenv("CORS_ORIGINS", "")
+# Comma-separated allowed origins (exact matches), e.g.:
+# "https://matrix-frontend-hh2z.vercel.app,http://localhost:3000"
+CORS_ORIGINS = [o.strip() for o in (os.getenv("CORS_ORIGINS") or "").split(",") if o.strip()]
 
-# ---------------- Persistence ----------------
+# Regex for origins (optional). Defaults to allowing *.vercel.app and localhost.
+CORS_ORIGIN_REGEX = os.getenv("CORS_ORIGIN_REGEX", r"^https?:\/\/([a-z0-9-]+\.)*vercel\.app(:\d+)?$|^http:\/\/localhost(:\d+)?$")
+
+STATE_FILE = os.getenv("STATE_FILE")   # e.g. /data/state.json (if you attach a disk)
+REDIS_URL  = os.getenv("REDIS_URL")    # e.g. rediss://:password@host:port
+REDIS_KEY  = os.getenv("REDIS_KEY", "matrix:state")
+
+# --- Persistence layer ---
 class StateStore:
     def __init__(self):
         self._mem: Dict[str, Any] = {"mode": 0, "brightness": 60, "rotation": 0}
         self._mode: str = "memory"
         self._r = None
-
         if REDIS_URL:
             try:
                 from redis import Redis
@@ -35,10 +36,8 @@ class StateStore:
             except Exception as e:
                 print(f"[store] REDIS_URL set but unusable: {e}; falling back.")
                 self._r = None
-
         if self._mode != "redis" and STATE_FILE:
             self._mode = "file"
-
         print(f"[store] mode = {self._mode}")
 
     def load(self) -> Dict[str, Any]:
@@ -59,7 +58,7 @@ class StateStore:
         s = {
             "mode": int(state.get("mode", 0)),
             "brightness": max(0, min(100, int(state.get("brightness", 60)))),
-            "rotation": int(state.get("rotation", 0)) % 360,
+            "rotation": int(state.get("rotation", 0)) % 360
         }
         try:
             if self._mode == "redis" and self._r:
@@ -73,12 +72,10 @@ class StateStore:
             print(f"[store] save error: {e}")
             self._mem = s
 
-
 store = StateStore()
 _state = store.load()
 
-
-# ---------------- WebSocket Hub ----------------
+# --- Websocket hub ---
 class Hub:
     def __init__(self):
         self.active: set[WebSocket] = set()
@@ -103,18 +100,15 @@ class Hub:
             for ws in dead:
                 self.active.discard(ws)
 
-
 hub = Hub()
 
-
-# ---------------- Models ----------------
+# --- API models ---
 class StateIn(BaseModel):
     mode: Optional[int] = Field(default=None, ge=0)
     brightness: Optional[int] = Field(default=None, ge=0, le=100)
-    rotation: Optional[int] = Field(default=None)  # 0, 90, 180, 270, etc.
+    rotation: Optional[int] = Field(default=None)  # 0/90/180/270 etc.
 
-
-# ---------------- Lifespan ----------------
+# --- lifespan ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _state
@@ -125,29 +119,35 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
 
-
 app = FastAPI(lifespan=lifespan)
 
-# ---------------- CORS (single middleware) ----------------
-origins_list = [o.strip() for o in CORS_ORIGINS_ENV.split(",") if o.strip()] or ["*"]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins_list,  # e.g. ["https://matrix-frontend-xxx.vercel.app", "http://localhost:3000"]
-    allow_credentials=False,     # keep False if using "*"
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "*"],
-)
-print("CORS allow_origins =", origins_list)
+# --- CORS (single middleware, robust defaults) ---
+# Priority: explicit CORS_ORIGINS if provided, otherwise regex (*.vercel.app + localhost)
+if CORS_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=CORS_ORIGINS,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
+else:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=CORS_ORIGIN_REGEX,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
 
-
-# ---------------- Helpers ----------------
+# --- Helpers ---
 def auth_ok(authorization: Optional[str]) -> bool:
     if not API_TOKEN:
         return True
     if not authorization:
         return False
     try:
-        scheme, token = authorization.split(" ", 1)
+        scheme, token = authorization.split(" ", 2)
     except ValueError:
         return False
     return scheme.lower() == "bearer" and token == API_TOKEN
@@ -163,15 +163,10 @@ async def save_and_broadcast():
     store.save(_state)
     await hub.broadcast({"type": "state", **current_state()})
 
-
-# ---------------- Routes ----------------
+# --- Routes ---
 @app.get("/", include_in_schema=False)
 def root():
     return RedirectResponse("/docs")
-
-@app.get("/favicon.ico", include_in_schema=False)
-def favicon():
-    return PlainTextResponse("", status_code=204)
 
 @app.get("/health")
 def health():
@@ -203,10 +198,8 @@ async def ws(ws: WebSocket):
     await ws.accept()
     await hub.register(ws)
     try:
-        # Send current state immediately so clients (Pi/FE) sync on connect
-        await ws.send_json({"type": "state", **current_state()})
+        await ws.send_json({"type":"state", **current_state()})
         while True:
-            # We don't require messages from clients; keep socket open
             await ws.receive_text()
     except WebSocketDisconnect:
         pass
