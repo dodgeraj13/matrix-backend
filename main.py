@@ -1,5 +1,3 @@
-# backend: main.py (replace the whole file)
-cat > main.py <<'PY'
 from __future__ import annotations
 import os, json, asyncio
 from typing import Optional, Dict, Any
@@ -262,4 +260,4 @@ async def ws(ws: WebSocket):
         pass
     finally:
         await hub.unregister(ws)
-PY
+
