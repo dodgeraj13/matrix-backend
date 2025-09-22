@@ -2,7 +2,7 @@ from __future__ import annotations
 import os, json, asyncio, hashlib
 from typing import Optional, Dict, Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Header, HTTPException, UploadFile, File, Request
-from fastapi.responses import JSONResponse, RedirectResponse, Response, FileResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
@@ -14,7 +14,7 @@ STATE_FILE = os.getenv("STATE_FILE")                 # e.g. /data/state.json
 REDIS_URL  = os.getenv("REDIS_URL")                  # optional
 REDIS_KEY  = os.getenv("REDIS_KEY", "matrix:state")
 IMAGE_FILE = os.getenv("IMAGE_FILE", "/data/image.png")
-IMAGE_KEY  = os.getenv("IMAGE_KEY", "matrix:image")  # redis key for raw PNG (optional)
+IMAGE_KEY  = os.getenv("IMAGE_KEY", "matrix:image")  # not used if file present
 MAX_UPLOAD = int(os.getenv("MAX_UPLOAD_MB", "10")) * 1024 * 1024  # 10 MB default
 
 # ------------ Persistence ------------
@@ -71,7 +71,6 @@ _state = store.load()
 
 # image cache / etag
 _image_etag: Optional[str] = None
-
 def _compute_etag(path: str) -> Optional[str]:
     try:
         with open(path, "rb") as f:
@@ -81,7 +80,6 @@ def _compute_etag(path: str) -> Optional[str]:
         return h.hexdigest()
     except Exception:
         return None
-
 def _load_etag_from_disk():
     global _image_etag
     if os.path.exists(IMAGE_FILE):
@@ -92,25 +90,17 @@ class Hub:
     def __init__(self):
         self.active: set[WebSocket] = set()
         self.lock = asyncio.Lock()
-
     async def register(self, ws: WebSocket):
-        async with self.lock:
-            self.active.add(ws)
-
+        async with self.lock: self.active.add(ws)
     async def unregister(self, ws: WebSocket):
-        async with self.lock:
-            self.active.discard(ws)
-
+        async with self.lock: self.active.discard(ws)
     async def broadcast(self, message: Dict[str, Any]):
         dead = []
         async with self.lock:
             for ws in list(self.active):
-                try:
-                    await ws.send_json(message)
-                except Exception:
-                    dead.append(ws)
-            for ws in dead:
-                self.active.discard(ws)
+                try: await ws.send_json(message)
+                except Exception: dead.append(ws)
+            for ws in dead: self.active.discard(ws)
 
 hub = Hub()
 
@@ -131,14 +121,13 @@ async def lifespan(app: FastAPI):
     except Exception: pass
 
 app = FastAPI(lifespan=lifespan)
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET","POST","OPTIONS"],
     allow_headers=["Authorization","Content-Type","*"],
-    expose_headers=["ETag"],  # so frontend can read ETag
+    expose_headers=["ETag"],
 )
 
 # ------------ Helpers ------------
@@ -184,7 +173,7 @@ async def set_state(payload: StateIn, authorization: Optional[str] = Header(None
     if changed: await save_and_broadcast()
     return JSONResponse(current_state())
 
-# --- Image: GET returns PNG with ETag; POST accepts multipart up to MAX_UPLOAD ---
+# --- Image: GET returns PNG w/ ETag; POST uploads up to MAX_UPLOAD ---
 @app.get("/image")
 def get_image(request: Request):
     global _image_etag
@@ -205,7 +194,6 @@ async def post_image(file: UploadFile = File(...), authorization: Optional[str] 
 
     os.makedirs(os.path.dirname(IMAGE_FILE), exist_ok=True)
 
-    # stream to disk, enforce limit
     size = 0
     with open(IMAGE_FILE, "wb") as out:
         while True:
@@ -219,13 +207,9 @@ async def post_image(file: UploadFile = File(...), authorization: Optional[str] 
                 raise HTTPException(413, f"File too large (> {MAX_UPLOAD//1024//1024} MB)")
             out.write(chunk)
 
-    # refresh ETag
     global _image_etag
     _image_etag = _compute_etag(IMAGE_FILE)
-
-    # Optional: broadcast a hint so frontends know image changed
     await hub.broadcast({"type":"image","etag": _image_etag})
-
     return JSONResponse({"ok": True, "size": size, "etag": _image_etag})
 
 @app.websocket("/ws")
@@ -235,7 +219,7 @@ async def ws(ws: WebSocket):
     try:
         await ws.send_json({"type":"state", **current_state()})
         while True:
-            await ws.receive_text()  # keep alive; we don't require client messages
+            await ws.receive_text()
     except WebSocketDisconnect:
         pass
     except Exception:
