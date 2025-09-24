@@ -1,19 +1,22 @@
 from __future__ import annotations
-import os, json, asyncio
+import os, json, asyncio, sys, traceback
 from typing import Optional, Dict, Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Header, HTTPException, Request, Response
-from fastapi.responses import JSONResponse, RedirectResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
 
 API_TOKEN = os.getenv("API_TOKEN", "MY_SUPER_TOKEN_123")
 CORS_ORIGINS = [o.strip() for o in (os.getenv("CORS_ORIGINS") or "").split(",") if o.strip()] or ["*"]
-STATE_FILE = os.getenv("STATE_FILE", "/data/state.json")
+
+# 👉 Free-plan friendly defaults: /tmp (ephemeral)
+STATE_FILE = os.getenv("STATE_FILE", "/tmp/state.json")
+IMAGE_FILE = os.getenv("IMAGE_FILE", "/tmp/picture.png")
+
 REDIS_URL  = os.getenv("REDIS_URL")
 REDIS_KEY  = os.getenv("REDIS_KEY", "matrix:state")
-IMAGE_FILE = os.getenv("IMAGE_FILE", "/data/picture.png")
 
 # ---------- persistence ----------
 class StateStore:
@@ -56,7 +59,9 @@ class StateStore:
             if self._mode == "redis" and self._r:
                 self._r.set(REDIS_KEY, json.dumps(s))
             elif self._mode == "file" and STATE_FILE:
-                os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+                parent = os.path.dirname(STATE_FILE)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
                 with open(STATE_FILE, "w") as f:
                     json.dump(s, f)
             self._mem = s
@@ -176,29 +181,38 @@ async def ws(ws: WebSocket):
 @app.get("/image")
 def get_image():
     try:
-        if not os.path.exists(IMAGE_FILE) or os.path.getsize(IMAGE_FILE) == 0:
+        if not IMAGE_FILE or not os.path.exists(IMAGE_FILE) or os.path.getsize(IMAGE_FILE) == 0:
             return Response(status_code=204)
         with open(IMAGE_FILE, "rb") as f:
             data = f.read()
         etag = f'W/"{len(data)}-{abs(hash(data)) & 0xFFFFFFFF:x}"'
         return Response(content=data, media_type="image/png", headers={"ETag": etag})
     except Exception as e:
+        print("[/image GET] error:", repr(e), file=sys.stderr)
+        traceback.print_exc()
         return Response(status_code=500, content=str(e))
 
 @app.post("/image")
 async def post_image(request: Request, authorization: Optional[str] = Header(None)):
     if not auth_ok(authorization):
         raise HTTPException(status_code=401, detail="Unauthorized")
+
     body = await request.body()
     if not body:
         raise HTTPException(status_code=422, detail="empty body")
+
     ctype = (request.headers.get("content-type") or "").lower().split(";")[0].strip()
     if ctype != "image/png":
         raise HTTPException(status_code=415, detail="content-type must be image/png")
+
     try:
-        os.makedirs(os.path.dirname(IMAGE_FILE), exist_ok=True)
+        parent = os.path.dirname(IMAGE_FILE)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         with open(IMAGE_FILE, "wb") as f:
             f.write(body)
         return Response(status_code=204)
     except Exception as e:
+        print("[/image POST] error:", repr(e), file=sys.stderr)
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
